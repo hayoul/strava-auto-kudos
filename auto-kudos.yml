@@ -1,0 +1,39 @@
+name: Strava Auto Kudos
+
+on:
+  # ── Runs every day at 08:00 UTC ─────────────────────────────────────────────
+  # Edit the cron expression to change the schedule:
+  #   '0 8 * * *'   = 08:00 UTC daily
+  #   '0 6 * * *'   = 06:00 UTC daily
+  #   '0 8 * * 1-5' = 08:00 UTC weekdays only
+  #   Use https://crontab.guru to build your own
+  schedule:
+    - cron: '0 8 * * *'
+
+  # ── Also allows a manual trigger from GitHub Actions UI ───────────────────
+  workflow_dispatch:
+
+jobs:
+  auto-kudos:
+    name: Give Kudos
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Auto Kudos
+        env:
+          STRAVA_CLIENT_ID:     ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+          STRAVA_REFRESH_TOKEN: ${{ secrets.STRAVA_REFRESH_TOKEN }}
+        run: python auto_kudos.py
