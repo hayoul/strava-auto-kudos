@@ -1,141 +1,152 @@
 """
-Strava Auto Kudos
------------------
-Fetches your Strava following feed and gives kudos to every
-activity that hasn't been kudoed yet.
+Strava Auto Kudos — Playwright edition
+---------------------------------------
+Strava removed the "following feed" from their public API.
+This script uses a headless browser (Playwright) to log in and
+give kudos exactly like a real user — no API key limitations.
 
-Requires three environment variables (set as GitHub Secrets):
-  STRAVA_CLIENT_ID      — from your Strava API application
-  STRAVA_CLIENT_SECRET  — from your Strava API application
-  STRAVA_REFRESH_TOKEN  — obtained once via OAuth (see README)
+GitHub Secrets required:
+  STRAVA_EMAIL     — your Strava login email
+  STRAVA_PASSWORD  — your Strava login password
 """
 
 import os
 import sys
 import time
-import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DELAY_BETWEEN_KUDOS = 0.8   # seconds — keep ≥ 0.5 to respect rate limits
-MAX_PAGES           = 5     # pages of feed to scan (50 activities per page)
-PER_PAGE            = 50
+SCROLL_PASSES      = 4      # how many times to scroll down the feed for more activities
+DELAY_BETWEEN_KUDOS = 600   # ms between each kudo click (keep ≥ 400)
+HEADLESS           = True   # set False locally to watch the browser
 
-STRAVA_TOKEN_URL    = "https://www.strava.com/oauth/token"
-STRAVA_FEED_URL     = "https://www.strava.com/api/v3/activities/following"
-STRAVA_KUDOS_URL    = "https://www.strava.com/api/v3/activities/{id}/kudos"
+DASHBOARD_URL = "https://www.strava.com/dashboard"
+LOGIN_URL     = "https://www.strava.com/login"
+
+# ── Kudo button selectors (Strava uses several patterns) ──────────────────────
+KUDO_SELECTORS = [
+    # Not-yet-given kudos buttons only
+    'button[data-testid="kudos_button"]:not([class*="active"])',
+    'button.btn-kudo:not(.btn-kudos-active)',
+    'button[title="Give kudos"]',
+    '.js-add-kudo:not(.active)',
+]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def get_access_token(client_id: str, client_secret: str, refresh_token: str) -> str:
-    """Exchange a refresh token for a short-lived access token."""
-    resp = requests.post(STRAVA_TOKEN_URL, data={
-        "client_id":     client_id,
-        "client_secret": client_secret,
-        "refresh_token": refresh_token,
-        "grant_type":    "refresh_token",
-    }, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    print(f"✅ Authenticated as athlete #{data.get('athlete', {}).get('id', '?')}")
-    return data["access_token"]
+def login(page, email: str, password: str) -> None:
+    print("🔐 Logging in...")
+    page.goto(LOGIN_URL, wait_until="networkidle")
+
+    page.fill('#email', email)
+    page.fill('#password', password)
+    page.click('#login-button')
+
+    # Wait for redirect to dashboard or home
+    page.wait_for_url("**/dashboard**", timeout=15_000)
+    print("✅ Logged in successfully")
 
 
-def fetch_feed(access_token: str) -> list[dict]:
-    """Fetch recent activities from the following feed (paginated)."""
-    headers = {"Authorization": f"Bearer {access_token}"}
-    activities = []
-
-    for page in range(1, MAX_PAGES + 1):
-        resp = requests.get(
-            STRAVA_FEED_URL,
-            headers=headers,
-            params={"per_page": PER_PAGE, "page": page},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        page_data = resp.json()
-
-        if not page_data:
-            break  # No more activities
-
-        activities.extend(page_data)
-        print(f"📄 Page {page}: {len(page_data)} activities fetched")
-
-        if len(page_data) < PER_PAGE:
-            break  # Last page
-
-    return activities
+def scroll_feed(page, passes: int) -> None:
+    """Scroll down to load more feed activities."""
+    for i in range(passes):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1200)
+        print(f"  📜 Scroll pass {i + 1}/{passes}")
 
 
-def give_kudos(access_token: str, activity_id: int) -> bool:
-    """Give kudos to a single activity. Returns True on success."""
-    headers = {"Authorization": f"Bearer {access_token}"}
-    resp = requests.post(
-        STRAVA_KUDOS_URL.format(id=activity_id),
-        headers=headers,
-        timeout=15,
-    )
-    # 201 = kudos given, 400 = already kudoed or own activity
-    return resp.status_code == 201
+def collect_kudo_buttons(page) -> list:
+    """Find all un-kudoed kudo buttons on the page."""
+    buttons = []
+    seen_ids = set()
+
+    for selector in KUDO_SELECTORS:
+        try:
+            els = page.query_selector_all(selector)
+            for el in els:
+                box = el.bounding_box()
+                if box:  # only visible elements
+                    uid = f"{box['x']:.0f},{box['y']:.0f}"
+                    if uid not in seen_ids:
+                        seen_ids.add(uid)
+                        buttons.append(el)
+        except Exception:
+            continue
+
+    return buttons
+
+
+def give_kudos(page) -> int:
+    """Click all available kudo buttons. Returns count given."""
+    buttons = collect_kudo_buttons(page)
+    print(f"\n👏 Found {len(buttons)} un-kudoed activities")
+
+    if not buttons:
+        print("✨ Nothing to kudo — all caught up!")
+        return 0
+
+    success = 0
+    for i, btn in enumerate(buttons, 1):
+        try:
+            btn.scroll_into_view_if_needed()
+            page.wait_for_timeout(DELAY_BETWEEN_KUDOS)
+            btn.click()
+            success += 1
+            print(f"  ✅ Kudoed activity {i}/{len(buttons)}")
+        except Exception as e:
+            print(f"  ⚠️  Skipped activity {i}: {e}")
+
+    return success
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Load secrets from environment
-    client_id     = os.environ.get("STRAVA_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("STRAVA_CLIENT_SECRET", "").strip()
-    refresh_token = os.environ.get("STRAVA_REFRESH_TOKEN", "").strip()
+    email    = os.environ.get("STRAVA_EMAIL", "").strip()
+    password = os.environ.get("STRAVA_PASSWORD", "").strip()
 
-    missing = [k for k, v in {
-        "STRAVA_CLIENT_ID":     client_id,
-        "STRAVA_CLIENT_SECRET": client_secret,
-        "STRAVA_REFRESH_TOKEN": refresh_token,
-    }.items() if not v]
-
-    if missing:
-        print(f"❌ Missing environment variables: {', '.join(missing)}")
+    if not email or not password:
+        print("❌ Missing STRAVA_EMAIL or STRAVA_PASSWORD environment variables")
         sys.exit(1)
 
-    print("🚀 Starting Strava Auto Kudos...")
+    print("🚀 Starting Strava Auto Kudos (Playwright)...")
 
-    # Authenticate
-    access_token = get_access_token(client_id, client_secret, refresh_token)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=HEADLESS)
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
 
-    # Fetch feed
-    activities = fetch_feed(access_token)
-    print(f"\n📊 Total activities found: {len(activities)}")
+        try:
+            login(page, email, password)
 
-    # Filter to un-kudoed activities that aren't your own
-    to_kudo = [
-        a for a in activities
-        if not a.get("kudoed") and not a.get("athlete_count", 0) == 0
-    ]
-    print(f"👏 Activities to kudo: {len(to_kudo)}")
+            # Navigate to dashboard and let feed load
+            page.goto(DASHBOARD_URL, wait_until="networkidle")
+            page.wait_for_timeout(2000)
 
-    if not to_kudo:
-        print("✨ Nothing to kudo — you're all caught up!")
-        return
+            # Scroll to load more activities
+            print(f"\n📡 Loading feed ({SCROLL_PASSES} scroll passes)...")
+            scroll_feed(page, SCROLL_PASSES)
 
-    # Give kudos
-    success = 0
-    skipped = 0
+            # Give kudos
+            total = give_kudos(page)
+            print(f"\n🏆 Done! Gave kudos to {total} activities.")
 
-    for activity in to_kudo:
-        activity_id   = activity["id"]
-        athlete_name  = activity.get("athlete", {}).get("firstname", "Someone")
-        activity_name = activity.get("name", "activity")
-
-        time.sleep(DELAY_BETWEEN_KUDOS)
-
-        if give_kudos(access_token, activity_id):
-            print(f"  ✅ Kudoed: {athlete_name} — \"{activity_name}\"")
-            success += 1
-        else:
-            print(f"  ⏭️  Skipped: {athlete_name} — \"{activity_name}\" (own/already kudoed)")
-            skipped += 1
-
-    print(f"\n🏆 Done! Gave {success} kudos, skipped {skipped}.")
+        except PWTimeout as e:
+            print(f"❌ Timeout: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            sys.exit(1)
+        finally:
+            context.close()
+            browser.close()
 
 
 if __name__ == "__main__":
